@@ -16,7 +16,7 @@
 7. Select "Copy"
 8. Go back to FBIs Main Menu
 9. Go to SD
-10. Press "A" on "<current directory>"
+10. Press "A" on "current directory"
 11. Select "Paste"
 12. Go to CTR NAND/data/random characters/extdata/00048000/f000000b/00000000
 13. Press "A" on "00000006"
