@@ -1,7 +1,7 @@
 #---------------------------------------------------------------------------------
 # EditMii - Nintendo 3DS Mii database editor
-# Build with devkitARM + libctru (devkitPro):   make / make cia
-# Output: EditMii.3dsx, EditMii.smdh, EditMii.cia
+# Build with devkitARM + libctru (devkitPro):   make
+# Output: EditMii.3dsx  (+ EditMii.smdh)
 #---------------------------------------------------------------------------------
 .SUFFIXES:
 #---------------------------------------------------------------------------------
@@ -20,9 +20,7 @@ INCLUDES	:=	include
 
 APP_TITLE		:=	EditMii
 APP_DESCRIPTION	:=	Mii database editor
-APP_AUTHOR		:=	Nether3554
-APP_PRODUCT_CODE:=	CTR-P-EMII
-APP_UNIQUE_ID	:=	0xFF354
+APP_AUTHOR		:=	EditMii
 
 #---------------------------------------------------------------------------------
 # options for code generation
@@ -43,7 +41,8 @@ LDFLAGS	=	-specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 LIBS	:= -lctru -lm
 
 #---------------------------------------------------------------------------------
-# list of directories containing libraries
+# list of directories containing libraries, this must be the top level containing
+# include and lib
 #---------------------------------------------------------------------------------
 LIBDIRS	:= $(PORTLIBS) $(CTRULIB)
 
@@ -88,12 +87,7 @@ endif
 
 export _3DSXFLAGS += --smdh=$(CURDIR)/$(TARGET).smdh
 
-# Ścieżki do gotowych plików z ba-GUI-nnertool oraz RSF
-export BANNER_FILE := $(CURDIR)/banner.bnr
-export ICON_FILE   := $(CURDIR)/icon.icn
-export RSF_FILE    := $(CURDIR)/EditMii.rsf
-
-.PHONY: $(BUILD) clean all cia
+.PHONY: $(BUILD) clean all
 
 #---------------------------------------------------------------------------------
 all: $(BUILD)
@@ -102,13 +96,10 @@ $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
-cia: $(BUILD)
-	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile $(OUTPUT).cia
-
 #---------------------------------------------------------------------------------
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf $(TARGET).cia
+	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf
 
 #---------------------------------------------------------------------------------
 else
@@ -119,19 +110,6 @@ else
 all	:	$(OUTPUT).3dsx
 
 $(OUTPUT).3dsx	:	$(OUTPUT).elf $(_3DSXDEPS)
-
-$(OUTPUT).cia	:	$(OUTPUT).elf $(BANNER_FILE) $(ICON_FILE) $(RSF_FILE)
-	makerom -f cia -o $@ \
-		-elf $(OUTPUT).elf \
-		-rsf $(RSF_FILE) \
-		-target t \
-		-exefslogo \
-		-icon $(ICON_FILE) \
-		-banner $(BANNER_FILE) \
-		-DAPP_TITLE="$(APP_TITLE)" \
-		-DAPP_PRODUCT_CODE="$(APP_PRODUCT_CODE)" \
-		-DAPP_UNIQUE_ID="$(APP_UNIQUE_ID)" \
-		-DAPP_ENCRYPTED=false
 
 $(OUTPUT).elf	:	$(OFILES)
 

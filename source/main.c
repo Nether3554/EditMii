@@ -12,13 +12,10 @@
  * Mii Maker records (your own Miis) are NEVER modified.
  */
 #include <3ds.h>
-#include <dirent.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <time.h>
 
 #include "mii_db.h"
 
@@ -29,14 +26,11 @@
 #define EXTDATA_ID_HIGH  0x00048000u
 #define ARCHIVE_ID_SHARED_EXTDATA ((FS_ArchiveID)0x00000007)
 
-#define BACKUP_DIR "sdmc:/3ds/EditMii/backup"
-
 #define ERR_BADSIZE   ((Result)0xE0000001)
 #define ERR_BADFORMAT ((Result)0xE0000002)
 #define ERR_SHORT     ((Result)0xE0000003)
 #define ERR_VERIFY    ((Result)0xE0000004)
 #define ERR_NOMEM     ((Result)0xE0000005)
-#define ERR_SDCARD    ((Result)0xE0000006)
 
 #define C_RESET  "\x1b[0m"
 #define C_RED    "\x1b[31;1m"
@@ -46,7 +40,7 @@
 #define C_GRAY   "\x1b[30;1m"
 
 enum { KIND_HIST = 0, KIND_INV = 1, KIND_MAKER = 2 };
-enum { SCR_MAIN, SCR_LIST, SCR_RESTORE };
+enum { SCR_MAIN, SCR_LIST };
 
 #define LIST_ROWS 24
 
@@ -94,6 +88,8 @@ static int g_menu = 0;
 static int g_apply_both = 1;
 static int g_dirty = 1;
 
+static int  g_tried = 0;          /* user already asked to open the NAND archive */
+
 static char g_msg[240] = "";
 static int  g_msg_level = 0;      /* 0 info, 1 error, 2 ok */
 
@@ -101,9 +97,28 @@ static int  g_msg_level = 0;      /* 0 info, 1 error, 2 ok */
 static char g_root[16][40];
 static int  g_nroot = 0, g_root_scanned = 0;
 
-/* SD backups */
-static char g_bk[64][48];
-static int  g_nbk = 0;
+/* ------------------------------------------------------------------ */
+/* custom startup: only the services this program needs.             */
+/* ------------------------------------------------------------------ */
+void __appInit(void);
+void __appExit(void);
+
+void __appInit(void)
+{
+    srvInit();
+    aptInit();
+    hidInit();
+    fsInit();
+}
+
+void __appExit(void)
+{
+    fsExit();
+    hidExit();
+    aptExit();
+    srvExit();
+}
+
 
 /* ------------------------------------------------------------------ */
 /* small helpers                                                      */
@@ -128,7 +143,6 @@ static const char *err_text(Result rc)
     case ERR_SHORT:     return "short read/write";
     case ERR_VERIFY:    return "read-back verification failed";
     case ERR_NOMEM:     return "out of memory";
-    case ERR_SDCARD:    return "SD card error";
     default:            return "";
     }
 }
@@ -314,62 +328,6 @@ static int any_changes(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* SD backups                                                         */
-/* ------------------------------------------------------------------ */
-static void ensure_dirs(void)
-{
-    mkdir("sdmc:/3ds", 0777);
-    mkdir("sdmc:/3ds/EditMii", 0777);
-    mkdir(BACKUP_DIR, 0777);
-}
-
-static int backup_data(int idx, const uint8_t *data, char *outname, size_t outsz)
-{
-    time_t t = time(NULL);
-    struct tm *tm = localtime(&t);
-    const char *base = idx == 0 ? "CFL_DB" : "CFL_OldDB";
-    char name[64], path[160];
-    snprintf(name, sizeof name, "%s_%04d%02d%02d_%02d%02d%02d.dat", base,
-             tm ? tm->tm_year + 1900 : 2000, tm ? tm->tm_mon + 1 : 1, tm ? tm->tm_mday : 1,
-             tm ? tm->tm_hour : 0, tm ? tm->tm_min : 0, tm ? tm->tm_sec : 0);
-    snprintf(path, sizeof path, BACKUP_DIR "/%s", name);
-    FILE *f = fopen(path, "wb");
-    if (!f) return -1;
-    size_t w = fwrite(data, 1, DB_SIZE, f);
-    int c = fclose(f);
-    if (w != DB_SIZE || c != 0) return -1;
-    if (outname) snprintf(outname, outsz, "%s", name);
-    return 0;
-}
-
-static void scan_backups(void)
-{
-    g_nbk = 0;
-    DIR *dir = opendir(BACKUP_DIR);
-    if (!dir) return;
-    struct dirent *e;
-    while ((e = readdir(dir)) != NULL && g_nbk < 64) {
-        size_t n = strlen(e->d_name);
-        if (n < 5 || n >= sizeof g_bk[0]) continue;
-        if (strcmp(e->d_name + n - 4, ".dat") != 0) continue;
-        if (strncmp(e->d_name, "CFL_DB_", 7) != 0 && strncmp(e->d_name, "CFL_OldDB_", 10) != 0) continue;
-        strcpy(g_bk[g_nbk++], e->d_name);
-    }
-    closedir(dir);
-    /* newest first (names contain a sortable timestamp) */
-    for (int i = 1; i < g_nbk; i++) {
-        char tmp[48];
-        int j = i;
-        strcpy(tmp, g_bk[i]);
-        while (j > 0 && strcmp(g_bk[j - 1], tmp) < 0) {
-            strcpy(g_bk[j], g_bk[j - 1]);
-            j--;
-        }
-        strcpy(g_bk[j], tmp);
-    }
-}
-
-/* ------------------------------------------------------------------ */
 /* list model                                                         */
 /* ------------------------------------------------------------------ */
 static const char *kind_title(int k)
@@ -548,20 +506,6 @@ static void do_wipe(void)
     rebuild_rows();
 }
 
-static void do_backup(void)
-{
-    if (!g_db[0].loaded && !g_db[1].loaded) { set_msg(1, "No database is loaded."); return; }
-    ensure_dirs();
-    char name[64];
-    int ok = 0, bad = 0;
-    for (int f = 0; f < 2; f++) {
-        if (!g_db[f].loaded) continue;
-        if (backup_data(f, g_db[f].orig, name, sizeof name) == 0) ok++; else bad++;
-    }
-    if (bad) set_msg(1, "Backup failed (is the SD card inserted and writable?).");
-    else set_msg(2, "Saved %d backup file(s) to " BACKUP_DIR, ok);
-}
-
 static int verify_written(DbFile *d)
 {
     Result rc = nand_read(d->path, g_tmpbuf);
@@ -591,19 +535,8 @@ static void do_save(void)
         }
     }
     if (!confirm("Write the changes to the system Mii database on NAND?",
-                 "A backup of the CURRENT NAND data is saved to the SD card first.",
+                 "No backup is made by this program. Make sure you have one (e.g. from GodMode9).",
                  "Reboot the console afterwards so every system module reloads the data.")) return;
-
-    ensure_dirs();
-    char name[64];
-    for (int f = 0; f < 2; f++) {
-        DbFile *d = &g_db[f];
-        if (!d->loaded || !d->changed) continue;
-        if (backup_data(f, d->orig, name, sizeof name) != 0) {
-            set_msg(1, "Backup to SD failed - nothing was written to NAND.");
-            return;
-        }
-    }
 
     int saved = 0;
     for (int f = 0; f < 2; f++) {
@@ -615,7 +548,7 @@ static void do_save(void)
             return;
         }
         if (!verify_written(d)) {
-            set_msg(1, "%s: read-back differs from what was written! Restore the backup from SD.", d->label);
+            set_msg(1, "%s: read-back differs from what was written!", d->label);
             return;
         }
         memcpy(d->orig, d->work, DB_SIZE);
@@ -623,60 +556,41 @@ static void do_save(void)
         db_check(d->work, d->problems, sizeof d->problems);
         saved++;
     }
-    set_msg(2, "Saved %d file(s) and verified. Backups are in " BACKUP_DIR ". Please reboot.", saved);
+    set_msg(2, "Saved %d file(s) and verified. Please reboot the console.", saved);
 }
 
-static void do_reload(void)
+static void do_load(void)
 {
     if (any_changes() && !confirm("Discard all unsaved changes and reload from NAND?", NULL, NULL)) return;
+    g_tried = 1;
+    if (!g_arch_ok) {
+        Result rc = arch_open();
+        if (R_FAILED(rc)) {
+            g_db[0].err = g_db[1].err = rc;
+            set_msg(1, "Cannot open shared extdata 0xF000000B (0x%08lX).", (unsigned long)rc);
+            return;
+        }
+    }
     load_all();
+    for (int i = 0; i < 2; i++)
     g_screen = SCR_MAIN;
-    set_msg(0, "Reloaded from NAND.");
-}
-
-static void do_restore(int which)
-{
-    char path[160];
-    const char *nm = g_bk[which];
-    int target = strncmp(nm, "CFL_OldDB_", 10) == 0 ? 1 : 0;
-    DbFile *d = &g_db[target];
-    if (!d->loaded) { set_msg(1, "%s is not loaded - cannot restore into it.", d->label); return; }
-
-    snprintf(path, sizeof path, BACKUP_DIR "/%s", nm);
-    char l1[120];
-    snprintf(l1, sizeof l1, "Load %s into memory as %s?", nm, d->label);
-    if (!confirm(l1, "This also replaces Mii Maker data with the backup's content.",
-                 "It is written to NAND only when you use \"Save changes\".")) return;
-
-    FILE *f = fopen(path, "rb");
-    if (!f) { set_msg(1, "Cannot open the backup file."); return; }
-    size_t n = fread(g_tmpbuf, 1, DB_SIZE + 1, f);
-    fclose(f);
-    if (n != DB_SIZE || db_validate(g_tmpbuf, n) != 0) { set_msg(1, "The backup file is not a valid Mii database."); return; }
-
-    memcpy(d->work, g_tmpbuf, DB_SIZE);
-    memcpy(d->maker_ref, d->work, MAKER_END);
-    d->changed = 1;
-    db_check(d->work, d->problems, sizeof d->problems);
-    g_screen = SCR_MAIN;
-    set_msg(2, "Backup loaded into %s. Use \"Save changes\" to write it to NAND.", d->label);
+    if (g_db[0].loaded || g_db[1].loaded) set_msg(2, "Databases loaded from NAND.");
+    else set_msg(1, "Could not load the Mii databases.");
 }
 
 /* ------------------------------------------------------------------ */
 /* drawing                                                            */
 /* ------------------------------------------------------------------ */
 static const char *MENU_ITEMS[] = {
+    "Load / reload databases from NAND",
     "Encounter history (StreetPass etc.)",
     "Mii Plaza invitations",
     "Mii Maker (read-only view)",
     "Wipe history + invitations",
     "Save changes to NAND",
-    "Reload from NAND (discard changes)",
-    "Backup current NAND state to SD",
-    "Restore from SD backup...",
     "Exit",
 };
-#define MENU_N 9
+#define MENU_N 7
 
 static void draw_main(void)
 {
@@ -693,6 +607,8 @@ static void draw_main(void)
                    d->problems[0] ? C_YELLOW "WARN" C_RESET : C_GREEN " OK " C_RESET,
                    db_maker_count(d->work), nh, (int)db_inv_count(d->work),
                    d->changed ? C_YELLOW "*" C_RESET : "");
+        } else if (!g_tried) {
+            printf(" %-13s " C_YELLOW "not loaded yet" C_RESET "\n", d->label);
         } else {
             printf(" %-13s " C_RED "NOT LOADED" C_RESET " (0x%08lX)\n", d->label, (unsigned long)d->err);
         }
@@ -718,10 +634,10 @@ static void draw_main_bottom(void)
         printf(" %s%s" C_RESET "\n\n", g_msg_level == 1 ? C_RED : g_msg_level == 2 ? C_GREEN : C_YELLOW, g_msg);
     for (int f = 0; f < 2; f++) {
         DbFile *d = &g_db[f];
-        if (!d->loaded) {
+        if (!d->loaded && g_tried) {
             printf(" " C_RED "%s:" C_RESET " %s\n", d->label, err_text(d->err));
             if (!g_arch_ok)
-                printf(" Archive open error 0x%08lX.\n Run EditMii from the Homebrew Launcher\n with Luma3DS.\n", (unsigned long)g_arch_err);
+                printf(" Archive open error 0x%08lX.\n Needs Luma3DS and enough FS rights.\n", (unsigned long)g_arch_err);
             if (d->detail[0]) printf(" %s\n", d->detail);
         } else if (d->problems[0]) {
             printf(" " C_YELLOW "%s:" C_RESET " %s\n", d->label, d->problems);
@@ -778,38 +694,10 @@ static void draw_list_bottom(void)
         printf(" %s%s" C_RESET "\n", g_msg_level == 1 ? C_RED : g_msg_level == 2 ? C_GREEN : C_YELLOW, g_msg);
 }
 
-static void draw_restore(void)
-{
-    consoleSelect(&g_top);
-    consoleClear();
-    printf(C_CYAN " Restore from SD backup" C_RESET "\n");
-    printf(" " BACKUP_DIR "\n");
-    printf(" ------------------------------------------------\n");
-    if (!g_nbk) printf("\n No backups found. They are created\n automatically before every save.\n");
-    int top = g_cursor >= LIST_ROWS ? g_cursor - LIST_ROWS + 1 : 0;
-    for (int r = 0; r < LIST_ROWS && top + r < g_nbk; r++) {
-        int i = top + r;
-        printf(" %s %-34s %s\n", i == g_cursor ? C_GREEN ">" C_RESET : " ", g_bk[i],
-               strncmp(g_bk[i], "CFL_OldDB_", 10) == 0 ? "OldDB" : "DB");
-    }
-}
-
-static void draw_restore_bottom(void)
-{
-    consoleSelect(&g_bot);
-    consoleClear();
-    printf("\n " C_CYAN "Controls" C_RESET "\n");
-    printf(" Up/Down  move\n A        load selected backup\n B        back\n\n");
-    printf(" The backup is loaded into memory\n only. Use \"Save changes\" in the\n main menu to write it to NAND.\n\n");
-    if (g_msg[0])
-        printf(" %s%s" C_RESET "\n", g_msg_level == 1 ? C_RED : g_msg_level == 2 ? C_GREEN : C_YELLOW, g_msg);
-}
-
 static void redraw(void)
 {
     if (g_screen == SCR_MAIN) { draw_main(); draw_main_bottom(); }
     else if (g_screen == SCR_LIST) { draw_list(); draw_list_bottom(); }
-    else { draw_restore(); draw_restore_bottom(); }
 }
 
 /* ------------------------------------------------------------------ */
@@ -835,15 +723,13 @@ static int handle_main(u32 k)
     int exitreq = (k & KEY_START) != 0;
     if (k & KEY_A) {
         switch (g_menu) {
-        case 0: enter_list(KIND_HIST); break;
-        case 1: enter_list(KIND_INV); break;
-        case 2: enter_list(KIND_MAKER); break;
-        case 3: do_wipe(); break;
-        case 4: do_save(); break;
-        case 5: do_reload(); break;
-        case 6: do_backup(); break;
-        case 7: scan_backups(); g_cursor = g_scroll = 0; g_screen = SCR_RESTORE; g_dirty = 1; break;
-        case 8: exitreq = 1; break;
+        case 0: do_load(); break;
+        case 1: enter_list(KIND_HIST); break;
+        case 2: enter_list(KIND_INV); break;
+        case 3: enter_list(KIND_MAKER); break;
+        case 4: do_wipe(); break;
+        case 5: do_save(); break;
+        case 6: exitreq = 1; break;
         }
     }
     if (exitreq) {
@@ -877,15 +763,6 @@ static void handle_list(u32 k)
     if (k & KEY_START) do_delete_marked();
 }
 
-static void handle_restore(u32 k)
-{
-    int dummy = 0;
-    if (k & KEY_DUP) move_cursor(&g_cursor, &dummy, g_nbk, -1);
-    if (k & KEY_DDOWN) move_cursor(&g_cursor, &dummy, g_nbk, 1);
-    if (k & KEY_B) { g_screen = SCR_MAIN; g_dirty = 1; }
-    if ((k & KEY_A) && g_nbk) do_restore(g_cursor);
-}
-
 /* ------------------------------------------------------------------ */
 /* main                                                               */
 /* ------------------------------------------------------------------ */
@@ -896,7 +773,6 @@ int main(int argc, char **argv)
     gfxInitDefault();
     consoleInit(GFX_TOP, &g_top);
     consoleInit(GFX_BOTTOM, &g_bot);
-    fsInit();
 
     int mem_ok = 1;
     for (int i = 0; i < 2; i++) {
@@ -908,15 +784,11 @@ int main(int argc, char **argv)
     if (!g_tmpbuf) mem_ok = 0;
 
     if (!mem_ok) {
+        g_tried = 1;
         set_msg(1, "Out of memory.");
         g_db[0].err = g_db[1].err = ERR_NOMEM;
-    } else if (R_FAILED(arch_open())) {
-        g_db[0].err = g_db[1].err = g_arch_err;
-        set_msg(1, "Cannot open shared extdata 0xF000000B (0x%08lX).", (unsigned long)g_arch_err);
     } else {
-        load_all();
-        if (g_db[0].loaded || g_db[1].loaded) set_msg(0, "Databases loaded from NAND.");
-        else set_msg(1, "Could not load the Mii databases.");
+        set_msg(0, "Select \"Load / reload databases\" (A) to begin.");
     }
 
     while (aptMainLoop()) {
@@ -927,8 +799,7 @@ int main(int argc, char **argv)
 
         int quit = 0;
         if (g_screen == SCR_MAIN) quit = handle_main(k);
-        else if (g_screen == SCR_LIST) handle_list(k);
-        else handle_restore(k);
+        else handle_list(k);
         if (quit) break;
 
         if (g_dirty) {
@@ -941,7 +812,6 @@ int main(int argc, char **argv)
     arch_close();
     for (int i = 0; i < 2; i++) { free(g_db[i].work); free(g_db[i].orig); }
     free(g_tmpbuf);
-    fsExit();
     gfxExit();
     return 0;
 }
